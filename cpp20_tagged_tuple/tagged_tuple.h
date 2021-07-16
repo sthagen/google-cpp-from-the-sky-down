@@ -83,13 +83,13 @@ struct dummy_conversion {};
 template <typename Tag, typename T, auto Init = default_init<T>>
 struct member_impl {
   static constexpr decltype(Init) init = Init;
-  T value;
+  T value_;
   template <typename Self>
   member_impl(Self& self, dummy_conversion) requires requires {
     { Init() }
     ->std::convertible_to<T>;
   }
-      : value(Init()) {
+      : value_(Init()) {
   }
 
       template <typename Self>
@@ -107,26 +107,27 @@ struct member_impl {
         { Init(self) }
         ->std::convertible_to<T>;
       }
-      : value(Init(self)) {}
-      member_impl(T value) : value(std::move(value)) {}
+      : value_(Init(self)) {}
+      member_impl(T value) : value_(std::move(value)) {}
+      member_impl() : value_(Init()) {}
       member_impl(const member_impl&) = default;
       member_impl& operator=(const member_impl&) = default;
       member_impl(member_impl&&) = default;
       member_impl& operator=(member_impl&&) = default;
       template <typename Self, typename OtherT, auto OtherInit>
       member_impl(Self& self, const member_impl<Tag, OtherT, OtherInit>& other)
-          : value(other.value){};
+          : value_(other.value_){};
       template <typename Self, typename OtherT, auto OtherInit>
       member_impl(Self& self, member_impl<Tag, OtherT, OtherInit>&& other)
-          : value(std::move(other.value)){};
+          : value_(std::move(other.value_)){};
       template <typename OtherT, auto OtherInit>
       member_impl& operator=(const member_impl<Tag, OtherT, OtherInit>& other) {
-        value = other.value;
+        value_ = other.value_;
         return *this;
       }
       template <typename OtherT, auto OtherInit>
       member_impl& operator=(member_impl<Tag, OtherT, OtherInit>&& other) {
-        value = std::move(other.value);
+        value_ = std::move(other.value_);
         return *this;
       };
 
@@ -134,6 +135,13 @@ struct member_impl {
 
       using tag_type = Tag;
       using value_type = T;
+
+      std::string_view key() const { return Tag::value.sv(); }
+
+      value_type& value() & { return value_; }
+      value_type&& value() && { return std::move(value_); }
+      const value_type& value() const& { return value_; }
+      const value_type&& value() const&& { return std::move(value_); }
 };
 template <fixed_string fs>
 struct tuple_tag {
@@ -160,8 +168,6 @@ struct is_tuple_tag<T> : std::true_type {};
 
 template <typename T>
 constexpr bool is_tuple_tag_v = is_tuple_tag<T>::value;
-
-
 
 struct auto_;
 
@@ -234,27 +240,80 @@ struct tagged_tuple_base : member_to_impl_t<Self, Members>... {
   tagged_tuple_base(Self& self, parameters<Args...> p)
       : member_to_impl_t<Self, Members>{self, p}... {}
 
+  tagged_tuple_base(){}
+  tagged_tuple_base(const tagged_tuple_base&) = default;
+  tagged_tuple_base& operator=(const tagged_tuple_base&) = default;
+
+  tagged_tuple_base(tagged_tuple_base&&) = default;
+  tagged_tuple_base& operator=(tagged_tuple_base&&) = default;
+
+
+
   auto operator<=>(const tagged_tuple_base&) const = default;
+
+  template <typename F>
+  auto apply(F&& f) & {
+    f(static_cast<member_to_impl_t<Self, Members>&>(*this)...);
+  }
+  template <typename F>
+  auto apply(F&& f) const& {
+    f(static_cast<const member_to_impl_t<Self, Members>&>(*this)...);
+  }
+
+  template <typename F>
+  auto apply(F&& f) && {
+    f(static_cast<member_to_impl_t<Self, Members>&&>(*this)...);
+  }
+
+  template<typename F>
+  void for_each(F&& f)&{
+      auto functor = [&](auto&&... a) mutable{
+        (f(std::forward<decltype(a)>(a)),...);
+      };
+      apply(functor);
+  }
+
+template<typename F>
+  void for_each(F&& f)const &{
+      auto functor = [&](auto&&... a) mutable{
+        (f(std::forward<decltype(a)>(a)),...);
+      };
+      apply(functor);
+  }
+
+template<typename F>
+  void for_each(F&& f)&&{
+      auto functor = [&f](auto&&... a) mutable{
+        (f(std::forward<decltype(a)>(a)),...);
+      };
+      apply(functor);
+  }
+
+
+
+  static constexpr auto size(){
+      return sizeof...(Members);
+  }
 };
 
 template <typename Tag, typename T, auto Init>
 decltype(auto) get_impl(member_impl<Tag, T, Init>& m) {
-  return (m.value);
+  return (m.value());
 }
 
 template <typename Tag, typename T, auto Init>
 decltype(auto) get_impl(const member_impl<Tag, T, Init>& m) {
-  return (m.value);
+  return (m.value());
 }
 
 template <typename Tag, typename T, auto Init>
 decltype(auto) get_impl(member_impl<Tag, T, Init>&& m) {
-  return std::move(m.value);
+  return std::move(m.value());
 }
 
 template <typename Tag, typename T, auto Init>
 decltype(auto) get_impl(const member_impl<Tag, T, Init>&& m) {
-  return std::move(m.value);
+  return std::move(m.value());
 }
 
 template <fixed_string fs, typename S>
@@ -265,14 +324,24 @@ decltype(auto) get(S&& s) {
 template <typename... Members>
 struct tagged_tuple : tagged_tuple_base<tagged_tuple<Members...>, Members...> {
   using super = tagged_tuple_base<tagged_tuple, Members...>;
-  template <typename... Args>
-  tagged_tuple(Args&&... args)
-      : super(*this, parameters{std::forward<Args>(args)...}) {}
+
+template <typename... Tag, typename... T, auto... Init>
+  tagged_tuple(member_impl<Tag,T,Init>... args)
+      : super(*this, parameters{std::move(args)...}) {}
+
+  tagged_tuple(){}
+  tagged_tuple(const tagged_tuple& other) = default;
+  tagged_tuple& operator=(const tagged_tuple& ) = default;
+  tagged_tuple(tagged_tuple&& ) = default;
+  tagged_tuple& operator=(tagged_tuple&& other) = default;
 
   template <typename Tag>
   auto& operator[](Tag) {
     return get<Tag::value>(*this);
   }
+
+  template <typename Tag>
+  auto& operator[](Tag) const { return get<Tag::value>(*this); }
 };
 
 template <typename Member>
@@ -286,9 +355,9 @@ struct member_impl_to_member {
 template <typename T>
 using member_impl_to_member_t = typename member_impl_to_member<T>::type;
 
-template <typename... Members>
-tagged_tuple(Members&&...)
-    -> tagged_tuple<member_impl_to_member_t<std::decay_t<Members>>...>;
+template <typename... Tag, typename... T, auto... Init>
+tagged_tuple(member_impl<Tag,T,Init>...)
+    -> tagged_tuple<member_impl_to_member_t<member_impl<Tag,T,Init>>...>;
 
 template <fixed_string fs>
 inline constexpr auto tag = tuple_tag<fixed_string<fs.size()>(fs)>{};
@@ -303,8 +372,7 @@ struct tag_comparator_predicate {
   }
 
   template <typename Tag, typename TS>
-  requires is_tuple_tag_v<Tag>
-  static const auto& get_value_for_comparison(
+  requires is_tuple_tag_v<Tag> static const auto& get_value_for_comparison(
       const Tag& tag, const TS& ts) {
     return tag(ts);
   }
