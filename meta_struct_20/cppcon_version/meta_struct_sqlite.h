@@ -26,7 +26,7 @@
 #include <type_traits>
 #include <utility>
 
-#include "../cpp20_tagged_tuple/tagged_tuple.h"
+#include "meta_struct.h"
 
 namespace ftsd {
 
@@ -105,17 +105,19 @@ auto read_row(sqlite3_stmt *stmt) {
   RowType row = {};
   std::size_t count = sqlite3_column_count(stmt);
 
-  auto size = row.size();
+  auto size = meta_struct_size(row);
   assert(size == count);
   if (size != count) {
     throw std::runtime_error(
         "sqlite error: mismatch between read_row and sql columns");
   }
   int index = 0;
-  row.for_each([&](auto &m) mutable {
-    read_row_into(stmt, index, m.value());
-    ++index;
-  });
+  meta_struct_for_each(
+      [&](auto &m) mutable {
+        read_row_into(stmt, index, m.value);
+        ++index;
+      },
+      row);
   return row;
 }
 
@@ -209,66 +211,41 @@ auto to_concrete(std::optional<T> &&o)
   }
 }
 
-template <auto... Tags, typename... Ts, auto... Init>
-auto to_concrete(
-    const tagged_tuple<ftsd::member<Tags, Ts, Init>...>
-        &t) {
-  return tagged_tuple{(tag<Tags> = to_concrete(get<Tags>(t)))...};
+template <auto... Tags, typename... Ts, auto... Init, auto... Attributes>
+auto to_concrete(const meta_struct<member<Tags, Ts, Init, Attributes>...> &t) {
+  return meta_struct_apply(
+      [](auto &...m) { return meta_struct{(arg<m.tag()> = m.value)...}; }, t);
 }
 
-template <auto... Tags, typename... Ts, auto... Init>
-auto to_concrete(
-    tagged_tuple<ftsd::member<Tags, Ts, Init>...> &&t) {
-  return tagged_tuple{(tag<Tags> = to_concrete(get<Tags>(std::move(t))))...};
+template <auto... Tags, typename... Ts, auto... Init, auto... Attributes>
+auto to_concrete(meta_struct<ftsd::member<Tags, Ts, Init, Attributes>...> &&t) {
+  return meta_struct{(arg<Tags> = to_concrete(get<Tags>(std::move(t))))...};
 }
 
-using ftsd::internal_tagged_tuple::fixed_string;
-
-template <fixed_string fs>
-struct compile_string {};
-
-template <bool make_optional, typename Tag, typename T, auto Init>
-auto maybe_make_optional(
-    ftsd::internal_tagged_tuple::member_impl<Tag, T, Init> m) {
-  if constexpr (make_optional) {
-    return ftsd::internal_tagged_tuple::member_impl<Tag, std::optional<T>,
-                                                    Init>{std::nullopt};
-  } else {
-    return m;
-  }
-}
-
-template <typename>
+template <fixed_string Tag>
 struct string_to_type;
 
 template <>
-struct string_to_type<compile_string<"integer">> {
+struct string_to_type<"integer"> {
   using type = std::int64_t;
 };
 
 template <>
-struct string_to_type<compile_string<"text">> {
+struct string_to_type<"text"> {
   using type = std::string_view;
 };
 
 template <>
-struct string_to_type<compile_string<"real">> {
+struct string_to_type<"real"> {
   using type = double;
 };
 
-template <typename T>
-using string_to_type_t = typename string_to_type<T>::type;
-
-constexpr std::string_view start_group = "{{";
-constexpr std::string_view end_group = "}}";
-
-constexpr std::string_view delimiters = ", ();";
-constexpr std::string_view quotes = "\"\'";
+template <fixed_string Tag>
+using string_to_type_t = typename string_to_type<Tag>::type;
 
 struct type_specs_count {
   std::size_t fields;
   std::size_t params;
-  auto operator<=>(const type_specs_count &) const = default;
 };
 
 inline constexpr std::string_view start_comment = "/*:";
@@ -299,16 +276,15 @@ constexpr auto get_type_spec_count() {
   return count;
 }
 
-template <typename First, typename Second>
-struct pair {
-  First first;
-  Second second;
-  constexpr auto operator<=>(const pair &other) const = default;
+struct query_substring {
+  std::size_t offset;
+  std::size_t count;
+  constexpr auto operator<=>(const query_substring &other) const = default;
 };
 
 struct type_spec {
-  pair<std::size_t, std::size_t> name;
-  pair<std::size_t, std::size_t> type;
+  query_substring name;
+  query_substring type;
   bool optional;
   constexpr auto operator<=>(const type_spec &other) const = default;
 };
@@ -383,19 +359,19 @@ constexpr auto parse_type_specs() {
           }
         }
         type_spec &spec = ret.fields[counts.fields];
-        spec.name.first = prev_name_begin;
-        spec.name.second = prev_name_end - prev_name_begin;
-        spec.type.first = comment_begin;
-        spec.type.second = comment_end - comment_begin;
+        spec.name.offset = prev_name_begin;
+        spec.name.count = prev_name_end - prev_name_begin;
+        spec.type.offset = comment_begin;
+        spec.type.count = comment_end - comment_begin;
         bool optional = false;
         auto type = str.substr(comment_begin, comment_end - comment_begin);
         if (!type.empty() && type.ends_with("?")) {
           optional = true;
-          --spec.type.second;
+          --spec.type.count;
         }
         spec.optional = optional;
         auto name =
-            str.substr(spec.name.first, spec.name.second - spec.name.first);
+            str.substr(spec.name.offset, spec.name.count - spec.name.offset);
         ++counts.fields;
       }
     }
@@ -410,10 +386,10 @@ constexpr auto parse_type_specs() {
           type.remove_suffix(1);
         }
         type_spec &spec = ret.params[counts.params];
-        spec.name.first = comment_begin;
-        spec.name.second = name.size();
-        spec.type.first = comment_begin + colon_pos + 1;
-        spec.type.second = type.size();
+        spec.name.offset = comment_begin;
+        spec.name.count = name.size();
+        spec.type.offset = comment_begin + colon_pos + 1;
+        spec.type.count = type.size();
         spec.optional = optional;
         ++counts.params;
       }
@@ -422,56 +398,67 @@ constexpr auto parse_type_specs() {
   return ret;
 }
 
-template <fixed_string query_string, type_spec ts>
-constexpr auto make_member_ts() {
-  constexpr auto sv = query_string.sv();
-  constexpr fixed_string<ts.name.second> name{
-      sv.substr(ts.name.first, ts.name.second)};
-  constexpr fixed_string<ts.type.second> type =
-      sv.substr(ts.type.first, ts.type.second);
-  return maybe_make_optional<ts.optional>(
-      tag<name> = (string_to_type_t<compile_string<type>>{}));
-}
+template <fixed_string query_string, type_spec ts, bool required>
+struct member_from_type_spec {
+  static constexpr auto sv = query_string.sv();
+  static constexpr auto name_str =
+      fixed_string<ts.name.count>::from_string_view(
+          sv.substr(ts.name.offset, ts.name.count));
+  static constexpr auto type_str =
+      fixed_string<ts.type.count>::from_string_view(
+          sv.substr(ts.type.offset, ts.type.count));
 
-template <fixed_string query_string, type_specs ts, std::size_t... I>
-constexpr auto make_members_helper(std::index_sequence<I...>) {
-  return tagged_tuple{make_member_ts<query_string, ts[I]>()...};
-}
+  using type_from_string = string_to_type_t<type_str>;
+  using value_type =
+      std::conditional_t<ts.optional, std::optional<type_from_string>,
+                         type_from_string>;
+
+  using type = ftsd::member<name_str, value_type, []() {
+    if constexpr (required && !ts.optional)
+      return ftsd::required;
+    else
+      return ftsd::default_init<value_type>();
+  }()>;
+};
+
+template <fixed_string query_string, type_specs ts, bool required,
+          typename Sequence>
+struct meta_struct_from_type_specs;
+
+template <fixed_string query_string, type_specs ts, bool required,
+          std::size_t... I>
+struct meta_struct_from_type_specs<query_string, ts, required,
+                                   std::index_sequence<I...>> {
+  using type = meta_struct<
+      typename member_from_type_spec<query_string, ts[I], required>::type...>;
+};
 
 template <fixed_string query_string>
-constexpr auto make_members() {
-  constexpr auto ts = parse_type_specs<query_string>();
-  constexpr auto fields = ts.fields;
-  if constexpr (fields.size() == 0) {
-    return tagged_tuple<>{};
-  } else {
-    return make_members_helper<query_string, fields>(
-        std::make_index_sequence<fields.size()>());
-  }
-}
-
-template <fixed_string query_string>
-constexpr auto make_parameters() {
-  constexpr auto ts = parse_type_specs<query_string>();
-  return make_members_helper<query_string, ts.params>(
-      std::make_index_sequence<ts.params.size()>());
-}
+struct meta_structs_from_query {
+  static constexpr auto ts = parse_type_specs<query_string>();
+  using fields_type = typename meta_struct_from_type_specs<
+      query_string, ts.fields, false,
+      std::make_index_sequence<ts.fields.size()>>::type;
+  using parameters_type = typename meta_struct_from_type_specs<
+      query_string, ts.params, true,
+      std::make_index_sequence<ts.params.size()>>::type;
+};
 
 template <typename T>
 std::true_type is_optional(const std::optional<T> &);
 
 std::false_type is_optional(...);
 
-template <typename PTuple>
-void do_binding(sqlite3_stmt *stmt, PTuple p_tuple) {
+template <typename ParametersMetaStruct>
+void bind_parameters(sqlite3_stmt *stmt, ParametersMetaStruct parameters) {
   int index = 1;
-  p_tuple.for_each([&](auto &m) mutable {
-    using m_t = std::decay_t<decltype(m)>;
-    using tag = typename m_t::tag_type;
-    auto r = bind_impl(stmt, index, m.value());
-    check_sqlite_return<bool>(r, true);
-    ++index;
-  });
+  meta_struct_for_each(
+      [&](auto &m) mutable {
+        auto r = bind_impl(stmt, index, m.value);
+        check_sqlite_return<bool>(r, true);
+        ++index;
+      },
+      parameters);
 }
 
 struct stmt_closer {
@@ -484,8 +471,11 @@ using unique_stmt = std::unique_ptr<sqlite3_stmt, stmt_closer>;
 
 template <fixed_string Query>
 class prepared_statement {
-  using RowType = decltype(make_members<Query>());
-  using PTuple = decltype(make_parameters<Query>());
+  using RowTypeAndParametersMetaStruct =
+      meta_structs_from_query<Query>;
+  using RowType = typename RowTypeAndParametersMetaStruct::fields_type;
+  using ParametersMetaStruct =
+      typename RowTypeAndParametersMetaStruct::parameters_type;
 
   unique_stmt stmt_;
   void reset_stmt() {
@@ -499,50 +489,30 @@ class prepared_statement {
   prepared_statement(sqlite3 *sqldb) {
     auto sv = Query.sv();
     sqlite3_stmt *stmt;
-    auto specs = parse_type_specs<Query>();
     auto rc = sqlite3_prepare_v2(sqldb, sv.data(), static_cast<int>(sv.size()),
                                  &stmt, 0);
     check_sqlite_return(rc);
     stmt_.reset(stmt);
   }
-  row_range<RowType> execute_rows() requires(PTuple::size() == 0) {
+  row_range<RowType> execute_rows(ParametersMetaStruct parameters = {}) {
     reset_stmt();
-    return row_range<RowType>(stmt_.get());
-  }
-  row_range<RowType> execute_rows(PTuple p_tuple) {
-    reset_stmt();
-    do_binding(stmt_.get(), std::move(p_tuple));
+    bind_parameters(stmt_.get(), std::move(parameters));
     return row_range<RowType>(stmt_.get());
   }
   std::optional<decltype(to_concrete(std::declval<RowType>()))>
-  execute_single_row(PTuple p_tuple) {
-    auto rng = execute_rows(std::move(p_tuple));
+  execute_single_row(ParametersMetaStruct parameters = {}) {
+    auto rng = execute_rows(std::move(parameters));
     auto begin = rng.begin();
     if (begin != rng.end()) {
       return to_concrete(*begin);
     } else {
       return std::nullopt;
     }
-  }
-  std::optional<decltype(to_concrete(std::declval<RowType>()))>
-  execute_single_row() requires(PTuple::size() == 0) {
-    auto rng = execute_rows();
-    auto begin = rng.begin();
-    if (begin != rng.end()) {
-      return to_concrete(*begin);
-    } else {
-      return std::nullopt;
-    }
-  }
-  void execute(PTuple p_tuple) {
-    reset_stmt();
-    do_binding(stmt_.get(), std::move(p_tuple));
-    auto r = sqlite3_step(stmt_.get());
-    check_sqlite_return(r, SQLITE_DONE);
   }
 
-  void execute() requires(PTuple::size() == 0) {
+  void execute(ParametersMetaStruct parameters = {}) {
     reset_stmt();
+    bind_parameters(stmt_.get(), std::move(parameters));
     auto r = sqlite3_step(stmt_.get());
     check_sqlite_return(r, SQLITE_DONE);
   }
@@ -555,7 +525,7 @@ decltype(auto) field(T &&t) {
 
 template <fixed_string fs, typename T>
 auto bind(T &&t) {
-  return tag<fs> = std::forward<T>(t);
+  return arg<fs> = std::forward<T>(t);
 }
 
 template <typename Tag>
@@ -568,8 +538,6 @@ struct param_helper {
 
 }  // namespace sqlite_experimental
 
-using sqlite_experimental::bind;
-using sqlite_experimental::field;
 using sqlite_experimental::prepared_statement;
 using sqlite_experimental::to_concrete;
 
